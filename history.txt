@@ -1,0 +1,92 @@
+ip -br address; ip route; ip netns list; sudo iptables -t nat -L -n -v
+mkdir -p ~/Documents/Lab4QA; sudo bash <<'SETUP'
+exec > >(tee /home/andriisvnk/Documents/Lab4QA/setup.txt) 2>&1
+set -x
+iptables -L -n
+iptables --table nat --flush
+sysctl -w net.ipv4.ip_forward=1
+grep -qxF 'net.ipv4.conf.all.forwarding=1' /etc/sysctl.conf || echo 'net.ipv4.conf.all.forwarding=1' >> /etc/sysctl.conf
+ip netns add client
+ip link add lan0 type veth peer name eth0 netns client
+ip address add 10.0.0.1/24 dev lan0
+ip link set lan0 up
+ip -n client link set lo up
+ip -n client link set eth0 up
+mkdir -p /etc/netns/client
+printf 'nameserver 192.168.1.1\nnameserver 8.8.8.8\n' > /etc/netns/client/resolv.conf
+cp /etc/dhcp/dhcpd.conf /etc/dhcp/dhcpd.conf.before-nat
+cat > /etc/dhcp/dhcpd.conf <<'DHCP'
+default-lease-time 600;
+max-lease-time 7200;
+option subnet-mask 255.255.255.0;
+option broadcast-address 10.0.0.255;
+option routers 10.0.0.1;
+option domain-name-servers 192.168.1.1, 8.8.8.8;
+option domain-name "mydomain.example";
+subnet 10.0.0.0 netmask 255.255.255.0 {
+  range 10.0.0.10 10.0.0.20;
+}
+DHCP
+printf 'INTERFACESv4="lan0"\nINTERFACESv6=""\n' > /etc/default/isc-dhcp-server
+dhcpd -t -cf /etc/dhcp/dhcpd.conf
+systemctl restart isc-dhcp-server
+iptables --table nat --append POSTROUTING --source 10.0.0.0/24 --out-interface enp0s3 --jump MASQUERADE
+ip netns exec client dhclient -v eth0
+ip -br -4 address
+ip -n client -br -4 address
+SETUP
+
+sudo bash <<'CHECKS'
+exec > >(tee /home/andriisvnk/Documents/Lab4QA/checks.txt) 2>&1
+set -x
+dumpcap -i lan0 -i enp0s3 -f 'arp or icmp or port 53' -a duration:35 -w /tmp/lab4qa-nat.pcapng &
+sleep 2
+ip neigh flush dev lan0
+ip netns exec client ip neigh flush dev eth0
+ping -c 3 -W 2 10.0.0.10
+ip netns exec client ping -c 3 -W 2 10.0.0.1
+ping -c 3 -W 2 google.com
+ip netns exec client ping -c 3 -W 2 192.168.1.1
+ip netns exec client ping -c 3 -W 2 google.com
+route -n
+ip netns exec client route -n
+cat /etc/dhcp/dhcpd.conf
+systemctl status isc-dhcp-server --no-pager --lines=0
+iptables -t nat -L POSTROUTING -n -v
+wait
+cp /tmp/lab4qa-nat.pcapng /home/andriisvnk/Documents/Lab4QA/nat.pcapng
+chown -R andriisvnk:andriisvnk /home/andriisvnk/Documents/Lab4QA
+CHECKS
+
+sudo bash <<'SAVE'
+exec > >(tee /home/andriisvnk/Documents/Lab4QA/persistence.txt) 2>&1
+set -x
+cp /tmp/lab4qa-nat.pcapng /home/andriisvnk/Documents/Lab4QA/nat.pcapng
+iptables-save > /etc/iptables.rules
+cat > /etc/systemd/system/lab4-iptables.service <<'UNIT'
+[Unit]
+Description=Restore NAT rules
+After=local-fs.target
+Before=network.target
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/iptables-restore /etc/iptables.rules
+RemainAfterExit=yes
+[Install]
+WantedBy=multi-user.target
+UNIT
+systemctl daemon-reload
+systemctl enable --now lab4-iptables.service
+iptables-restore --test /etc/iptables.rules
+systemctl status lab4-iptables.service --no-pager
+sysctl net.ipv4.ip_forward
+cat /etc/iptables.rules
+chown -R andriisvnk:andriisvnk /home/andriisvnk/Documents/Lab4QA
+SAVE
+
+sudo systemctl restart lab4-iptables.service; systemctl status lab4-iptables.service --no-pager --lines=0; history -w; cp ~/.bash_history ~/Documents/Lab4QA/history.txt; timeout 600 python3 -m http.server 8767 --directory ~/Documents/Lab4QA >/tmp/lab4qa-http.log 2>&1 &
+cat /etc/dhcp/dhcpd.conf; sysctl net.ipv4.ip_forward; sudo iptables -t nat -S; systemctl is-active isc-dhcp-server
+route -n; sudo ip netns exec client route -n; ping -c 3 10.0.0.10; sudo ip netns exec client ping -c 3 10.0.0.1
+sudo ip netns exec client ping -c 3 192.168.1.1; sudo ip netns exec client ping -c 3 google.com
+tshark -r ~/Documents/Lab4QA/nat.pcapng > ~/Documents/Lab4QA/packets.txt; wireshark -r ~/Documents/Lab4QA/nat.pcapng -Y arp >/tmp/lab4qa-wireshark.log 2>&1 &
+systemctl status lab4-iptables.service --no-pager --lines=0 | tee ~/Documents/Lab4QA/restore-check.txt; history -w; cp ~/.bash_history ~/Documents/Lab4QA/history.txt
